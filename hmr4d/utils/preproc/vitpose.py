@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+import cv2
+import os
 from .vitpose_pytorch import build_model
 from .vitfeat_extractor import get_batch
 from tqdm import tqdm
@@ -10,14 +12,71 @@ from hmr4d.utils.geo_transform import cvt_p2d_from_pm1_to_i
 from hmr4d.utils.geo.flip_utils import flip_heatmap_coco17
 
 
+# Constants for image normalization (Standard for ViTPose/COCO models)
+IMAGE_MEAN = np.array([0.485, 0.456, 0.406])
+IMAGE_STD = np.array([0.229, 0.224, 0.225])
+
+
 class VitPoseExtractor:
     def __init__(self, tqdm_leave=True):
-        ckpt_path = "inputs/checkpoints/vitpose/vitpose-h-multi-coco.pth"
+        # Allow environment variable to override checkpoint path for flexibility
+        ckpt_path = os.environ.get(
+            "VITPOSE_CKPT_PATH", 
+            "inputs/checkpoints/vitpose/vitpose-h-multi-coco.pth"
+        )
         self.pose = build_model("ViTPose_huge_coco_256x192", ckpt_path)
         self.pose.cuda().eval()
 
         self.flip_test = True
         self.tqdm_leave = tqdm_leave
+
+    @staticmethod
+    def _crop_and_resize(img, center, scale, output_size=256, enlarge_ratio=1.0):
+        """
+        Crop and resize image based on center and scale.
+        Args:
+            img: numpy array (H, W, 3)
+            center: numpy array (2,) [cx, cy]
+            scale: float, box size
+            output_size: int, target size
+            enlarge_ratio: float, factor to enlarge the crop box
+        Returns:
+            cropped_img: numpy array (output_size, output_size, 3)
+        """
+        h, w = img.shape[:2]
+        # Enlarge scale
+        scale = scale * enlarge_ratio
+        
+        # Calculate crop box coordinates
+        half_size = scale / 2
+        left = int(center[0] - half_size)
+        right = int(center[0] + half_size)
+        top = int(center[1] - half_size)
+        bottom = int(center[1] + half_size)
+
+        # Handle boundaries by padding if necessary, but simple slicing is faster for real-time
+        # Using cv2.warpAffine for robust cropping similar to mmpose standard processing
+        
+        # Standard affine transformation for cropping
+        src_dir = np.zeros((3, 2), dtype=np.float32)
+        dst_dir = np.zeros((3, 2), dtype=np.float32)
+        
+        src_dir[0] = [max(0, left), max(0, top)]
+        src_dir[1] = [min(w - 1, right), min(h - 1, bottom)]
+        src_dir[2] = [max(0, left), min(h - 1, bottom)]
+        
+        dst_dir[0] = [0, 0]
+        dst_dir[1] = [output_size - 1, output_size - 1]
+        dst_dir[2] = [0, output_size - 1]
+        
+        try:
+            trans = cv2.getAffineTransform(np.float32(src_dir), np.float32(dst_dir))
+            cropped_img = cv2.warpAffine(img, trans, (output_size, output_size), flags=cv2.INTER_LINEAR)
+        except Exception:
+            # Fallback to simple resize if affine fails (e.g., invalid points)
+            cropped_img = cv2.resize(img[top:bottom, left:right], (output_size, output_size))
+            
+        return cropped_img
 
     @torch.no_grad()
     def extract(self, video_path, bbx_xys, img_ds=0.5):
@@ -70,6 +129,110 @@ class VitPoseExtractor:
 
         vitpose = torch.cat(vitpose, dim=0).clone()  # (F, 17, 3)
         return vitpose
+
+    @torch.no_grad()
+    def extract_single_frame(self, img_rgb, bbx_xys, img_ds=0.5):
+        """Extract pose from a single frame for real-time inference.
+        
+        Args:
+            img_rgb: RGB image as numpy array (H, W, 3) or torch tensor (H, W, 3)
+            bbx_xys: bounding box (3,) or (1, 3) - [cx, cy, size] in original image coords
+            img_ds: downsample factor applied to image before cropping
+            
+        Returns:
+            kp2d: keypoints (17, 3) as torch tensor
+        """
+        # 1. Prepare Input Data
+        if isinstance(img_rgb, np.ndarray):
+            img_tensor = torch.from_numpy(img_rgb)  # (H, W, 3)
+        else:
+            img_tensor = img_rgb.cpu()
+            
+        if isinstance(bbx_xys, np.ndarray):
+            bbx_xys = torch.from_numpy(bbx_xys)
+        if bbx_xys.ndim == 1:
+            bbx_xys = bbx_xys.unsqueeze(0) # (1, 3)
+            
+        # Move to CPU/Numpy for OpenCV processing if needed
+        img_np = img_tensor.numpy().astype(np.uint8) if img_tensor.dtype != torch.uint8 else img_tensor.numpy()
+        center_orig = bbx_xys[0, :2].numpy()
+        size_orig = bbx_xys[0, 2].item()
+        
+        # 2. Downsample Image (if required)
+        if img_ds != 1.0:
+            H, W = img_np.shape[:2]
+            new_H, new_W = int(H * img_ds), int(W * img_ds)
+            img_np = cv2.resize(img_np, (new_W, new_H))
+            center = center_orig * img_ds
+            size = size_orig * img_ds
+        else:
+            center = center_orig
+            size = size_orig
+            
+        # 3. Crop and Resize to Model Input (256x256)
+        # Note: ViTPose usually expects 256x192 input for the backbone, but preprocessing crops to square 256x256
+        # The model input slice [:, :, 32:224] effectively uses a 192 height from the 256 image.
+        img_crop = self._crop_and_resize(img_np, center, size, output_size=256)
+        
+        # 4. Normalize and Convert to Tensor
+        # Convert RGB to float and normalize
+        img_input = img_crop.astype(np.float32) / 255.0
+        img_input = (img_input - IMAGE_MEAN) / IMAGE_STD
+        img_input = torch.from_numpy(img_input).permute(2, 0, 1).unsqueeze(0).float() # (1, 3, 256, 256)
+        
+        # 5. Run Inference
+        # Crop to specific input region expected by the model (height 32:224 -> 192px)
+        imgs_batch = img_input[:, :, 32:224].cuda() # (1, 3, 192, 256) -- Wait, standard is usually HxW. 
+        # Let's check original code: imgs[j : j + batch_size, :, :, 32:224]
+        # Original shape: (L, 3, H, W). Slice on last dim? No, usually H is dim 2.
+        # In get_batch, if it returns (L, 3, H, W), then [:, :, 32:224] slices the Width if H=256, W=192?
+        # Actually ViTPose input is typically 256x192 (HxW). 
+        # If input is 256x256, slicing [:, :, 32:224] on Dim 3 (Width) gives 192 width.
+        # So input is (B, 3, 256, 192).
+        
+        if self.flip_test:
+            heatmap, heatmap_flipped = self.pose(torch.cat([imgs_batch, imgs_batch.flip(3)], dim=0)).chunk(2)
+            heatmap_flipped = flip_heatmap_coco17(heatmap_flipped)
+            heatmap = (heatmap + heatmap_flipped) * 0.5
+        else:
+            heatmap = self.pose(imgs_batch.clone())
+            
+        # 6. Post-process
+        heatmap_np = heatmap.clone().cpu().numpy()
+        
+        # Prepare scale for keypoints_from_heatmaps
+        # Scale format expected: [width, height] / 200
+        # The bbox used for keypoint recovery should correspond to the crop used.
+        # We cropped using 'size' at downsampled resolution.
+        # The effective box size in the crop coordinate system (256x256) is 'size'.
+        # However, keypoints_from_heatmaps maps back to original image coordinates.
+        # We must pass the ORIGINAL image center and scale (adjusted for ds if we want coords in DS space, 
+        # but usually we want coords in Original Image Space).
+        
+        # If we want output keypoints in the original image coordinate system:
+        center_out = center_orig
+        size_out = size_orig
+        
+        # Scale vector: [width, height]
+        # In the batch extraction: scale = (torch.cat((bbx_xys_batch[:, [2]] * 24 / 32, bbx_xys_batch[:, [2]]), dim=1) / 200)
+        # This implies Width = Size * 24/32 ? And Height = Size? 
+        # This looks like an aspect ratio adjustment for the bounding box representation.
+        # Let's stick to the logic in the batch method:
+        scale_w = size_out * (24 / 32) # Adjusting aspect ratio as per original code logic
+        scale_h = size_out
+        scale_np = np.array([[scale_w, scale_h]]) / 200.0
+        
+        preds, maxvals = keypoints_from_heatmaps(
+            heatmaps=heatmap_np, 
+            center=center_out.reshape(1, 2), 
+            scale=scale_np, 
+            use_udp=True
+        )
+        
+        kp2d = np.concatenate((preds, maxvals), axis=-1)
+        kp2d = torch.from_numpy(kp2d)
+        
+        return kp2d.squeeze(0)
 
 
 def get_heatmap_preds(heatmap, normalize_keypoints=True, thr=0.0, soft=False):
