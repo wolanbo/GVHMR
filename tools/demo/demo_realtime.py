@@ -28,9 +28,10 @@ from hmr4d.utils.vis.renderer import Renderer, get_global_cameras_static, get_gr
 from hmr4d.utils.geo_transform import apply_T_on_points, compute_T_ayfz2ay
 from einops import einsum
 
+import time
 
 CRF = 23  # Video quality setting
-WINDOW_SIZE = 30  # Fixed sliding window size
+WINDOW_SIZE = 20  # Fixed sliding window size
 MIN_DEPTH = 20  # 20mm
 MAX_DEPTH = 2000  # 2000mm
 
@@ -324,6 +325,8 @@ def process_video_sliding_window(cap_or_queue, cfg, args, width, height, fps, ma
                     Log.info(f"[Video] Reached end of video at frame {frame_idx}")
                     break
             
+            begin_all = time.time()
+            
             # Convert BGR to RGB
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             
@@ -332,6 +335,7 @@ def process_video_sliding_window(cap_or_queue, cfg, args, width, height, fps, ma
                 raw_writer.write_frame(frame_bgr)
             
             # ===== Real-time Tracking ===== #
+            begin = time.time()
             track_results = tracker.yolo.track(
                 frame_bgr,
                 device="cuda",
@@ -340,6 +344,7 @@ def process_video_sliding_window(cap_or_queue, cfg, args, width, height, fps, ma
                 verbose=False,
                 stream=False
             )
+            print(f"Tracking time: {time.time() - begin:.2f}s") 
             
             bbx_xyxy_frame = None
             kp2d_frame = None
@@ -361,10 +366,14 @@ def process_video_sliding_window(cap_or_queue, cfg, args, width, height, fps, ma
                     bbx_xyxy_frame = bbx_xyxy_best[0]
                     
                     # Extract 2D Pose
+                    begin_time = time.time()
                     kp2d_frame = vitpose_extractor.extract_single_frame(frame_rgb, bbx_xys)
+                    print(f"Extract 2D pose: {time.time() - begin_time}")
                     
                     # Extract Visual Features
+                    begin_time = time.time()
                     vit_feat_frame = extractor.extract_single_frame_features(frame_rgb, bbx_xys)
+                    print(f"Extract visual features: {time.time() - begin_time}")
                     
                     # Show Preview (Optional)
                     if args.show_preview or args.verbose:
@@ -468,7 +477,12 @@ def process_video_sliding_window(cap_or_queue, cfg, args, width, height, fps, ma
             data = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in data.items()}
             
             # Run prediction
+            begin_time = time.time()
             pred = model.predict(data, static_cam=args.static_cam)
+            # pred = model.predict(data, static_cam=False)
+            print(f"Inference time: {time.time() - begin_time}")
+            print(f"All time: {time.time() - begin_all}")
+            
             pred = detach_to_cpu(pred)
             
             infer_time = Log.sync_time() - tic_infer
@@ -562,8 +576,8 @@ def process_video_sliding_window(cap_or_queue, cfg, args, width, height, fps, ma
     total_time = Log.sync_time() - start_time
     Log.info(f"\n{'='*60}")
     Log.info(f"[Complete] Total frames processed: {total_processed}")
-    Log.info(f"[Complete] Total time: {total_time:.2f}s")
-    Log.info(f"[Complete] Average FPS: {total_processed/total_time:.2f}")
+    Log.info(f"[Complete] Total time: {total_time}s")
+    Log.info(f"[Complete] Average FPS: {total_processed/total_time}")
     Log.info(f"[Complete] Frames streamed via ZMQ: {total_processed}")
     Log.info(f"{'='*60}")
 
